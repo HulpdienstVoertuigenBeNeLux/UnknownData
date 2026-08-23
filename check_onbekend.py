@@ -7,6 +7,7 @@ from datetime import datetime
 
 # URL of the JSON endpoint
 JSON_URL = "https://hulpdienstvoertuigenbenelux.nl/fetch-sheet?region=NL"
+API_KEY = os.getenv("API_KEY")  # Loaded from GitHub Secrets
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")  # Loaded from GitHub Secrets
 
 
@@ -17,6 +18,10 @@ def fetch_and_check():
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
+    
+    # Add API key to headers
+    if API_KEY:
+        headers["x-api-key"] = API_KEY
 
     try:
         response = requests.get(JSON_URL, headers=headers, timeout=15)
