@@ -60,19 +60,29 @@ def fetch_and_check():
 
 def save_to_csv(entries, headers, filename):
     print(f"Saving results to {filename}...")
-    with open(filename, mode="w", newline="", encoding="utf-8") as csv_file:
+    with open(filename, mode="w", newline="", encoding="utf-8-sig") as csv_file:
+        # Gebruik utf-8-sig zodat Excel speciale tekens en UTF-8 direct goed inleest
         writer = csv.writer(csv_file)
         
-        # Schrijf eerst de headers als die er zijn, plus een kolom voor het rijnummer
         if headers:
             writer.writerow(["Row Number"] + headers)
         else:
             writer.writerow(["Row Number", "Row Data"])
 
-        # Schrijf elke entry weg
         for entry in entries:
             row_num = entry["row_number"]
-            row_data = entry["row_data"]
+            row_data = list(entry["row_data"])  # Maak een kopie zodat we de data kunnen aanpassen
+            
+            # Kolom C is index 2 (Rij-index 0 = A, 1 = B, 2 = C)
+            # Als kolom C bestaat, dwingen we af dat het als tekst wordt gelezen
+            if len(row_data) > 2:
+                val = str(row_data[2])
+                # Door een tab-karakter (\t) of een aanhalingsteken ervoor te zetten, 
+                # weet Excel dat het om ruwe tekst gaat en maakt hij er geen datum van.
+                # Een apostrof (') werkt vaak het mooist in Excel, een tab (\t) werkt ook universeel.
+                if val and not val.startswith("'"):
+                    row_data[2] = f"'{val}"
+
             writer.writerow([row_num] + row_data)
 
 
