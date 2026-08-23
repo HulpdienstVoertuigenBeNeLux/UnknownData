@@ -1,5 +1,9 @@
 import os
 import requests
+import json
+import csv
+from io import StringIO
+from datetime import datetime
 
 # URL of the JSON endpoint
 JSON_URL = "https://hulpdienstvoertuigenbenelux.nl/fetch-sheet?region=NL"
@@ -56,6 +60,34 @@ def fetch_and_check():
         print("No 'ONBEKEND' values found!")
 
 
+def generate_csv_file(entries, headers):
+    """Generate a CSV file in memory and return as bytes."""
+    output = StringIO()
+    
+    # Write headers if available
+    if headers:
+        writer = csv.writer(output)
+        writer.writerow(headers)
+    
+    # Write entries
+    writer = csv.writer(output)
+    for entry in entries:
+        writer.writerow(entry["row_data"])
+    
+    return output.getvalue().encode('utf-8')
+
+
+def generate_json_file(entries, headers):
+    """Generate a JSON file in memory and return as bytes."""
+    data = {
+        "timestamp": datetime.now().isoformat(),
+        "total_entries": len(entries),
+        "headers": headers,
+        "entries": entries
+    }
+    return json.dumps(data, indent=2, ensure_ascii=False).encode('utf-8')
+
+
 def send_discord_alert(entries, headers):
     if not DISCORD_WEBHOOK_URL:
         print(
@@ -64,26 +96,54 @@ def send_discord_alert(entries, headers):
         )
         return
 
-    # Discord has a 2000 character limit per message, so we batch or summarize
-    chunk_size = 5
-    for i in range(0, len(entries), chunk_size):
-        chunk = entries[i : i + chunk_size]
-        description = ""
+    # Generate both CSV and JSON files
+    csv_data = generate_csv_file(entries, headers)
+    json_data = generate_json_file(entries, headers)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_filename = f"onbekend_entries_{timestamp}.csv"
+    json_filename = f"onbekend_entries_{timestamp}.json"
 
-        for entry in chunk:
-            row_num = entry["row_number"]
-            row_data = entry["row_data"]
-            description += f"**Row {row_num}**\n```json\n{row_data}\n```\n\n"
+    # Send summary message
+    summary_payload = {
+        "content": f"⚠️ **'ONBEKEND' values detected in Hulpdienstvoertuigen Dataset!**\n"
+                   f"📊 Total entries found: **{len(entries)}**\n"
+                   f"📥 Files are attached below for download.",
+        "embeds": [
+            {
+                "title": "Detection Summary",
+                "color": 15158332,
+                "fields": [
+                    {
+                        "name": "Total Entries",
+                        "value": str(len(entries)),
+                        "inline": True
+                    },
+                    {
+                        "name": "Timestamp",
+                        "value": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "inline": True
+                    }
+                ]
+            }
+        ]
+    }
 
-        payload = {
-            "content": (
-                "⚠️ **'ONBEKEND' values detected in Hulpdienstvoertuigen Dataset!**"
-                f" (Batch {i // chunk_size + 1})"
-            ),
-            "embeds": [{"description": description[:4096], "color": 15158332}],
-        }
+    requests.post(DISCORD_WEBHOOK_URL, json=summary_payload)
 
-        requests.post(DISCORD_WEBHOOK_URL, json=payload)
+    # Send CSV file
+    files_csv = {
+        'file': (csv_filename, csv_data, 'text/csv')
+    }
+    requests.post(DISCORD_WEBHOOK_URL, files=files_csv)
+
+    # Send JSON file
+    files_json = {
+        'file': (json_filename, json_data, 'application/json')
+    }
+    requests.post(DISCORD_WEBHOOK_URL, files=files_json)
+
+    print(f"Discord alert sent with attachments: {csv_filename}, {json_filename}")
 
 
 if __name__ == "__main__":
