@@ -5,33 +5,41 @@ import csv
 from io import StringIO
 from datetime import datetime
 
-# URL of the JSON endpoint (paginated API)
-API_BASE_URL = "https://hulpdienstvoertuigenbenelux.nl/api/vehicles"
-API_KEY = os.getenv("API_KEY")  # Loaded from GitHub Secrets
+# URL of the JSON endpoint (not paginated / sheet endpoint)
+API_BASE_URL = "https://hulpdienstvoertuigenbenelux.nl/fetch-sheet?region=NL"
+SHEET_API_KEY = os.getenv("SHEET_API_KEY")  # Loaded from environment / GitHub Secrets
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")  # Loaded from GitHub Secrets
 
 
 def fetch_all_pages():
-    """Fetch all pages from the paginated API and return combined data."""
-    print("Fetching paginated JSON data...")
+    """Fetch data from the sheet endpoint and return combined data.
+
+    The original script supported a paginated API. The fetch-sheet endpoint
+    typically returns a single JSON payload (not paginated). This function
+    keeps a fallback pagination loop but will work fine if the endpoint
+    ignores the `page` parameter or returns a single list/dict.
+    """
+    print("Fetching JSON data from fetch-sheet endpoint...")
     
     # Adding a realistic User-Agent prevents many modern servers from blocking requests
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://hulpdienstvoertuigenbenelux.nl/",
     }
-    
-    # Add API key to headers
-    if API_KEY:
-        headers["x-api-key"] = API_KEY
+
+    # Add sheet API key header if available
+    if SHEET_API_KEY:
+        headers["X-API-Key"] = SHEET_API_KEY
 
     all_vehicles = []
     page = 1
-    
+
     while True:
         try:
-            # Fetch page with pagination parameter
-            url = f"{API_BASE_URL}?page={page}"
-            print(f"Fetching page {page}...")
+            # Many sheet endpoints are not paginated; include `page` param as a no-op if ignored.
+            url = f"{API_BASE_URL}&page={page}" if "?" in API_BASE_URL else f"{API_BASE_URL}?page={page}"
+            print(f"Fetching page {page}... URL: {url}")
             response = requests.get(url, headers=headers, timeout=15)
             response.raise_for_status()
         except requests.exceptions.RequestException as e:
@@ -46,21 +54,35 @@ def fetch_all_pages():
         # Safely parse JSON
         try:
             data = response.json()
-        except requests.exceptions.JSONDecodeError:
+        except ValueError:
+            # requests raises simple ValueError for JSON decode errors in some versions
             print(f"Error: Response from page {page} was not valid JSON.")
             print(f"First 200 characters of response content:\n{response.text[:200]}")
             break
 
-        # Extract vehicles from response
-        # Adjust based on actual API response structure (e.g., data.get("data"), data.get("vehicles"), etc.)
+        # If the endpoint returns a dict with a key like `data` or `vehicles`, extract it
         vehicles = data.get("data", []) or data.get("vehicles", []) or data
         
+        # If the returned payload is a dict representing metadata + rows, try to extract rows
+        if isinstance(vehicles, dict) and "rows" in vehicles:
+            vehicles = vehicles.get("rows", [])
+
         if not vehicles:
             print(f"No more vehicles on page {page}. Stopping pagination.")
             break
 
-        all_vehicles.extend(vehicles)
-        print(f"Page {page}: fetched {len(vehicles)} vehicles (total: {len(all_vehicles)})")
+        # If the endpoint returned a single dict (non-list), wrap it
+        if isinstance(vehicles, dict):
+            all_vehicles.append(vehicles)
+        else:
+            all_vehicles.extend(vehicles)
+
+        print(f"Page {page}: fetched {len(vehicles) if hasattr(vehicles, '__len__') else 1} vehicles (total: {len(all_vehicles)})")
+
+        # If the endpoint is not paginated, stop after first successful fetch
+        if page == 1 and ("fetch-sheet" in API_BASE_URL or not isinstance(data, dict) or not data.get("next_page")):
+            break
+
         page += 1
 
     return all_vehicles
@@ -69,7 +91,7 @@ def fetch_all_pages():
 def fetch_and_check():
     print("Starting ONBEKEND detection...\n")
     
-    # Fetch all pages
+    # Fetch all pages / sheet
     all_vehicles = fetch_all_pages()
     
     if not all_vehicles:
@@ -112,7 +134,8 @@ def generate_csv_file(entries):
         writer.writerow(headers)
         
         for entry in entries:
-            writer.writerow(entry["row_data"].values())
+            # preserve order by using the same header keys
+            writer.writerow([entry["row_data"].get(h, "") for h in headers])
     else:
         # If entries are lists, just write them
         for entry in entries:
