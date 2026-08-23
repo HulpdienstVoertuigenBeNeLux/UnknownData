@@ -11,205 +11,197 @@ SHEET_API_KEY = os.getenv("SHEET_API_KEY")  # Loaded from environment / GitHub S
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")  # Loaded from GitHub Secrets
 
 
-def fetch_all_pages():
-    """Fetch data from the sheet endpoint and return combined data.
+def fetch_sheet():
+    """Fetch data from the non-paginated sheet endpoint and return list of rows.
 
-    The original script supported a paginated API. The fetch-sheet endpoint
-    typically returns a single JSON payload (not paginated). This function
-    keeps a fallback pagination loop but will work fine if the endpoint
-    ignores the `page` parameter or returns a single list/dict.
+    This endpoint is expected to return a single JSON payload (list or dict).
     """
-    print("Fetching JSON data from fetch-sheet endpoint...")
-    
-    # Adding a realistic User-Agent prevents many modern servers from blocking requests
+    print("Fetching JSON data from fetch-sheet endpoint (single request)...")
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Referer": "https://hulpdienstvoertuigenbenelux.nl/",
     }
 
-    # Add sheet API key header if available
     if SHEET_API_KEY:
         headers["X-API-Key"] = SHEET_API_KEY
 
-    all_vehicles = []
-    page = 1
+    try:
+        response = requests.get(API_BASE_URL, headers=headers, timeout=15)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to fetch sheet: {e}")
+        return []
 
-    while True:
-        try:
-            # Many sheet endpoints are not paginated; include `page` param as a no-op if ignored.
-            url = f"{API_BASE_URL}&page={page}" if "?" in API_BASE_URL else f"{API_BASE_URL}?page={page}"
-            print(f"Fetching page {page}... URL: {url}")
-            response = requests.get(url, headers=headers, timeout=15)
-            response.raise_for_status()
-        except requests.exceptions.RequestException as e:
-            print(f"Failed to fetch page {page}: {e}")
-            break
+    if not response.text.strip():
+        print("Received an empty response from fetch-sheet.")
+        return []
 
-        # Check if response body has content
-        if not response.text.strip():
-            print(f"Received an empty response from page {page}.")
-            break
+    try:
+        data = response.json()
+    except ValueError:
+        print("Error: Response was not valid JSON.")
+        print(response.text[:200])
+        return []
 
-        # Safely parse JSON
-        try:
-            data = response.json()
-        except ValueError:
-            # requests raises simple ValueError for JSON decode errors in some versions
-            print(f"Error: Response from page {page} was not valid JSON.")
-            print(f"First 200 characters of response content:\n{response.text[:200]}")
-            break
+    # Try common shapes (list, dict with `data`/`vehicles`, dict with `rows`)
+    rows = []
+    if isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict):
+        rows = data.get("data") or data.get("vehicles") or data.get("rows") or data
+        # If `rows` is still a dict with `rows` key, extract
+        if isinstance(rows, dict) and "rows" in rows:
+            rows = rows.get("rows", [])
 
-        # If the endpoint returns a dict with a key like `data` or `vehicles`, extract it
-        vehicles = data.get("data", []) or data.get("vehicles", []) or data
-        
-        # If the returned payload is a dict representing metadata + rows, try to extract rows
-        if isinstance(vehicles, dict) and "rows" in vehicles:
-            vehicles = vehicles.get("rows", [])
+        # If it's a dict representing a single vehicle, wrap it
+        if isinstance(rows, dict):
+            rows = [rows]
+    else:
+        # unknown shape, return empty
+        print("Unexpected JSON shape returned from sheet endpoint.")
+        return []
 
-        if not vehicles:
-            print(f"No more vehicles on page {page}. Stopping pagination.")
-            break
+    print(f"Fetched {len(rows)} rows from sheet.")
+    return rows
 
-        # If the endpoint returned a single dict (non-list), wrap it
-        if isinstance(vehicles, dict):
-            all_vehicles.append(vehicles)
-        else:
-            all_vehicles.extend(vehicles)
 
-        print(f"Page {page}: fetched {len(vehicles) if hasattr(vehicles, '__len__') else 1} vehicles (total: {len(all_vehicles)})")
+def is_onbekend_in_value(value):
+    """Return True if the given value (any type) contains the string 'ONBEKEND' (case-insensitive)."""
+    if value is None:
+        return False
+    if isinstance(value, (int, float, bool)):
+        value = str(value)
+    if isinstance(value, str):
+        return "ONBEKEND" in value.upper()
+    # For other types (lists/dicts), check their string representation but prefer not to scan large nested structures
+    try:
+        return "ONBEKEND" in json.dumps(value, ensure_ascii=False).upper()
+    except Exception:
+        return False
 
-        # If the endpoint is not paginated, stop after first successful fetch
-        if page == 1 and ("fetch-sheet" in API_BASE_URL or not isinstance(data, dict) or not data.get("next_page")):
-            break
 
-        page += 1
+def flatten_vehicle_row(vehicle):
+    """Return a flat dict of top-level primitive fields of the vehicle.
 
-    return all_vehicles
+    Skip nested lists/dicts (like `posts`) to avoid exploding the CSV. Nested structures are omitted.
+    """
+    flat = {}
+    if isinstance(vehicle, dict):
+        for k, v in vehicle.items():
+            # Keep simple scalar values only
+            if v is None:
+                flat[k] = ""
+            elif isinstance(v, (str, int, float, bool)):
+                flat[k] = v
+            else:
+                # skip lists/dicts/complex objects (e.g., posts)
+                continue
+    else:
+        # If the row is a list/tuple, map to col0, col1, ...
+        for i, v in enumerate(vehicle):
+            flat[f"col{i}"] = v if v is not None else ""
+    return flat
 
 
 def fetch_and_check():
     print("Starting ONBEKEND detection...\n")
-    
-    # Fetch all pages / sheet
-    all_vehicles = fetch_all_pages()
-    
-    if not all_vehicles:
+
+    all_rows = fetch_sheet()
+    if not all_rows:
         print("No vehicles data found!")
         return
 
-    print(f"\n✓ Total vehicles fetched: {len(all_vehicles)}\n")
+    print(f"\n✓ Total rows fetched: {len(all_rows)}\n")
 
-    onbekend_entries = []
+    matches = []
 
-    # Loop through all vehicles and check for 'ONBEKEND'
-    for index, vehicle in enumerate(all_vehicles):
-        # Handle both dict and list formats
-        if isinstance(vehicle, dict):
-            row_str_repr = [str(item) for item in vehicle.values()]
+    # Look for 'ONBEKEND' anywhere in the row. If a row contains it, include the flattened vehicle as one CSV row.
+    for idx, row in enumerate(all_rows):
+        found = False
+        if isinstance(row, dict):
+            for v in row.values():
+                if is_onbekend_in_value(v):
+                    found = True
+                    break
         else:
-            row_str_repr = [str(item) for item in vehicle]
-        
-        if any("ONBEKEND" in item.upper() for item in row_str_repr):
-            onbekend_entries.append({"row_number": index + 1, "row_data": vehicle})
+            # list/tuple or other
+            for v in row:
+                if is_onbekend_in_value(v):
+                    found = True
+                    break
 
-    print(f"Found {len(onbekend_entries)} rows containing 'ONBEKEND'.")
+        if found:
+            flat = flatten_vehicle_row(row)
+            # attach original index for traceability if desired
+            flat["_source_row_index"] = idx + 1
+            matches.append(flat)
 
-    # Output results locally or send to Discord
-    if onbekend_entries:
-        send_discord_alert(onbekend_entries)
+    print(f"Found {len(matches)} rows containing 'ONBEKEND'.")
+
+    if matches:
+        send_discord_alert(matches)
     else:
         print("No 'ONBEKEND' values found!")
 
 
-def generate_csv_file(entries):
-    """Generate a CSV file in memory and return as bytes."""
+def generate_csv_file_dicts(dict_rows):
+    """Generate CSV bytes from a list of flat dict rows. Use union of keys for headers, preserving insertion order."""
+    if not dict_rows:
+        return b""
+
+    # Collect headers in insertion order across rows
+    headers = []
+    seen = set()
+    for row in dict_rows:
+        for k in row.keys():
+            if k not in seen:
+                seen.add(k)
+                headers.append(k)
+
     output = StringIO()
     writer = csv.writer(output)
-    
-    # If entries are dicts, use keys as headers
-    if entries and isinstance(entries[0]["row_data"], dict):
-        first_entry = entries[0]["row_data"]
-        headers = list(first_entry.keys())
-        writer.writerow(headers)
-        
-        for entry in entries:
-            # preserve order by using the same header keys
-            writer.writerow([entry["row_data"].get(h, "") for h in headers])
-    else:
-        # If entries are lists, just write them
-        for entry in entries:
-            writer.writerow(entry["row_data"])
-    
-    return output.getvalue().encode('utf-8')
+    writer.writerow(headers)
+
+    for row in dict_rows:
+        writer.writerow([row.get(h, "") for h in headers])
+
+    return output.getvalue().encode("utf-8")
 
 
-def generate_json_file(entries):
-    """Generate a JSON file in memory and return as bytes."""
-    data = {
-        "timestamp": datetime.now().isoformat(),
-        "total_entries": len(entries),
-        "entries": entries
-    }
-    return json.dumps(data, indent=2, ensure_ascii=False).encode('utf-8')
-
-
-def send_discord_alert(entries):
-    if not DISCORD_WEBHOOK_URL:
-        print(
-            "Discord Webhook URL not set. Printing locally:"
-            f" {len(entries)} entries found."
-        )
-        return
-
-    # Generate both CSV and JSON files
-    csv_data = generate_csv_file(entries)
-    json_data = generate_json_file(entries)
-    
+def send_discord_alert(dict_rows):
+    # Only one CSV file is sent, containing all matching rows (flattened). No JSON file.
+    csv_data = generate_csv_file_dicts(dict_rows)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_filename = f"onbekend_entries_{timestamp}.csv"
-    json_filename = f"onbekend_entries_{timestamp}.json"
 
-    # Send summary message
+    if not DISCORD_WEBHOOK_URL:
+        # Save locally and print path
+        with open(csv_filename, "wb") as f:
+            f.write(csv_data)
+        print(f"Discord Webhook URL not set. Wrote CSV locally: {csv_filename}")
+        return
+
+    # Send summary message first
     summary_payload = {
-        "content": f"⚠️ **'ONBEKEND' values detected in Hulpdienstvoertuigen Dataset!**\n"
-                   f"📊 Total entries found: **{len(entries)}**\n"
-                   f"📥 Files are attached below for download.",
-        "embeds": [
-            {
-                "title": "Detection Summary",
-                "color": 15158332,
-                "fields": [
-                    {
-                        "name": "Total Entries",
-                        "value": str(len(entries)),
-                        "inline": True
-                    },
-                    {
-                        "name": "Timestamp",
-                        "value": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "inline": True
-                    }
-                ]
-            }
-        ]
+        "content": f"⚠️ **'ONBEKEND' values detected in Hulpdienstvoertuigen Dataset!**\n📊 Total entries found: **{len(dict_rows)}**",
     }
 
-    requests.post(DISCORD_WEBHOOK_URL, json=summary_payload)
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json=summary_payload, timeout=10)
+    except Exception as e:
+        print(f"Failed to post summary to Discord: {e}")
 
     # Send CSV file
     files_csv = {
         'file': (csv_filename, csv_data, 'text/csv')
     }
-    requests.post(DISCORD_WEBHOOK_URL, files=files_csv)
-
-    # Send JSON file
-    files_json = {
-        'file': (json_filename, json_data, 'application/json')
-    }
-    requests.post(DISCORD_WEBHOOK_URL, files=files_json)
-
-    print(f"Discord alert sent with attachments: {csv_filename}, {json_filename}")
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, files=files_csv, timeout=20)
+        print(f"Discord alert sent with attachment: {csv_filename}")
+    except Exception as e:
+        print(f"Failed to send CSV to Discord: {e}")
 
 
 if __name__ == "__main__":
