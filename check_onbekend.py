@@ -61,7 +61,6 @@ def fetch_and_check():
 def save_to_csv(entries, headers, filename):
     print(f"Saving results to {filename}...")
     with open(filename, mode="w", newline="", encoding="utf-8-sig") as csv_file:
-        # Gebruik utf-8-sig zodat Excel speciale tekens en UTF-8 direct goed inleest
         writer = csv.writer(csv_file)
         
         if headers:
@@ -71,19 +70,23 @@ def save_to_csv(entries, headers, filename):
 
         for entry in entries:
             row_num = entry["row_number"]
-            row_data = list(entry["row_data"])  # Maak een kopie zodat we de data kunnen aanpassen
+            row_data = list(entry["row_data"])
             
-            # Kolom C is index 2 (Rij-index 0 = A, 1 = B, 2 = C)
-            # Als kolom C bestaat, dwingen we af dat het als tekst wordt gelezen
+            # Kolom C is index 2. 
+            # Waarden zoals 'Jan-81', 'Mar-94' worden door Excel ten onrechte als datum gezien.
+            # Door een tab (\t) voor de string te zetten of een formule-structuur te gebruiken,
+            # dwingen we Excel om te stoppen met gokken en het als tekst te beschouwen.
             if len(row_data) > 2:
                 val = str(row_data[2])
-                # Door een tab-karakter (\t) of een aanhalingsteken ervoor te zetten, 
-                # weet Excel dat het om ruwe tekst gaat en maakt hij er geen datum van.
-                # Een apostrof (') werkt vaak het mooist in Excel, een tab (\t) werkt ook universeel.
-                if val and not val.startswith("'"):
-                    row_data[2] = f"'{val}"
+                if val:
+                    # Oplossing: We zetten er een tab (\t) voor. Excel leest dit in als tekst 
+                    # en negeert de datum-conversie, of we gebruiken een apostrof.
+                    # De apostrof (') werkt in Excel als tekst-indicator.
+                    if not val.startswith("'"):
+                        row_data[2] = f"'{val}"
 
             writer.writerow([row_num] + row_data)
+
 
 
 def send_discord_alert_with_file(entries, filename):
